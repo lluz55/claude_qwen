@@ -1,0 +1,16 @@
+# Nix
+.result
+*.d
+
+# IDE
+.idea/
+.vscode/
+.swp/
+*.swp
+
+# OMC
+.omc/
+
+# OS
+.DS_Store
+Thumbs.db
