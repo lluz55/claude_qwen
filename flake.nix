@@ -1,124 +1,149 @@
 {
-  description = "Claude Code integration with Qwen OAuth authentication";
+  description = "Claude Code + Qwen OAuth Integration via Nix Flake";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-
-        # Configuration
-        nodeVersion = pkgs.nodejs_22;
-        qwenModel = "qwen-coder-plus";
-        tokenFile = "\${HOME}/.qwen/oauth_creds.json";
-
-        # Main wrapper script
-        claude-qwen = pkgs.writeShellScriptBin "claude-qwen" ''
-          set -euo pipefail
-
-          # Configuration
-          export TOKEN_FILE="${tokenFile}"
-          export QWEN_MODEL="${qwenModel}"
-          ROUTER_PID=""
-
-          # Cleanup function for background processes
-          cleanup() {
-            if [[ -n "''${ROUTER_PID:-}" ]]; then
-              kill "''${ROUTER_PID}" 2>/dev/null || true
-              wait "''${ROUTER_PID}" 2>/dev/null || true
+  outputs = { self, nixpkgs }:
+    let
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      
+      qwenModel = "qwen3-coder-plus";
+    in
+    {
+      packages = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          
+          claude-qwen-script = pkgs.writeShellScriptBin "claude-qwen" ''
+            #!/usr/bin/env bash
+            set -e
+            
+            QWEN_MODEL="${qwenModel}"
+            OAUTH_FILE="$HOME/.qwen/oauth_creds.json"
+            ROUTER_DIR="$HOME/.claude-code-router"
+            
+            # Garantir que jq e nodejs estejam no PATH
+            export PATH="${pkgs.jq}/bin:${pkgs.nodejs_22}/bin:$PATH"
+            
+            # 1. Verificar/obter token OAuth
+            if [ ! -f "$OAUTH_FILE" ] || [ -z "$(${pkgs.jq}/bin/jq -r '.access_token // empty' "$OAUTH_FILE" 2>/dev/null)" ]; then
+                echo "⚠️ Token Qwen OAuth não encontrado ou inválido."
+                echo "Iniciando qwen-code para autenticação..."
+                echo "👉 DICA: Digite /auth, escolha a opção 'Qwen OAuth', conclua no navegador e depois digite /exit"
+                echo ""
+                ${pkgs.nodejs_22}/bin/npx -y @qwen-code/qwen-code@latest
             fi
-          }
-          trap cleanup EXIT INT TERM
-
-          # Color output helpers
-          info() { echo "📦 $*"; }
-          success() { echo "✅ $*"; }
-          error() { echo "❌ $*" >&2; }
-          step() { echo "⚙️  $*"; }
-
-          # 1. Check and validate authentication
-          if [[ ! -f "$TOKEN_FILE" ]]; then
-            info "Qwen authentication required. Starting login..."
-            ${nodeVersion}/bin/npx -y @qwen-code/qwen-code
-          fi
-
-          # Validate token exists and is not empty
-          if ! TOKEN=$(${pkgs.jq}/bin/jq -r '.access_token // empty' "$TOKEN_FILE" 2>/dev/null); then
-            error "Failed to read token from $TOKEN_FILE"
-            error "Please ensure the file contains valid JSON with 'access_token' field"
-            exit 1
-          fi
-
-          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
-            error "Token is empty or invalid. Please re-authenticate:"
-            error "  rm -f $TOKEN_FILE"
-            error "  claude-qwen"
-            exit 1
-          fi
-
-          success "Authentication verified"
-
-          # 2. Ensure Claude Code is available
-          step "Preparing environment..."
-
-          # Add global npm bin to PATH for the router to find 'claude' command
-          export PATH="$PATH:$(npm prefix -g)/bin"
-
-          # 3. Start the router in background
-          step "Starting bridge server on localhost..."
-          ${nodeVersion}/bin/npx -y @musistudio/claude-code-router \
-            start --token "$TOKEN" --model "$QWEN_MODEL" &
-          ROUTER_PID=$!
-
-          # Wait for router to initialize
-          sleep 2
-
-          # Verify router is still running
-          if ! kill -0 "$ROUTER_PID" 2>/dev/null; then
-            error "Router failed to start. Check your configuration."
-            exit 1
-          fi
-
-          success "Bridge server running (PID: $ROUTER_PID)"
-
-          # 4. Launch Claude Code
-          echo ""
-          step "Launching Claude Code..."
-          ${nodeVersion}/bin/npx -y @anthropic-ai/claude-code
-        '';
-
-      in {
-        devShells.default = pkgs.mkShell {
-          buildInputs = [
-            nodeVersion
-            pkgs.jq
-            claude-qwen
-            pkgs.nodePackages.npm
-          ];
-
-          shellHook = ''
-            # Ensure library paths are available
-            export LD_LIBRARY_PATH=${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
-
-            # Welcome message
+            
+            if [ ! -f "$OAUTH_FILE" ]; then
+                echo "❌ Falha ao obter credenciais. O arquivo não foi criado."
+                exit 1
+            fi
+            
+            TOKEN=$(${pkgs.jq}/bin/jq -r '.access_token' "$OAUTH_FILE")
+            
+            if [ "$TOKEN" = "null" ] || [ -z "$TOKEN" ]; then
+                echo "❌ Token inválido no arquivo."
+                exit 1
+            fi
+            
+            # 2. Configurar o router
+            mkdir -p "$ROUTER_DIR"
+            echo "⚙️ Gerando configuração do router..."
+            ${pkgs.jq}/bin/jq -n \
+              --arg token "$TOKEN" \
+              --arg model "$QWEN_MODEL" \
+              '{
+                PORT: 3456,
+                LOG: true,
+                Providers: [
+                  {
+                    name: "qwen",
+                    api_base_url: "https://portal.qwen.ai/v1/chat/completions",
+                    api_key: $token,
+                    models: [$model],
+                    transformer: { use: ["deepseek"] }
+                  }
+                ],
+                Router: {
+                  default: ("qwen," + $model),
+                  think: ("qwen," + $model)
+                }
+              }' > "$ROUTER_DIR/config.json"
+            
+            # 3. Iniciar o router em background
+            echo "🚀 Garantindo que nenhuma instância anterior esteja rodando..."
+            pkill -f "ccr start" 2>/dev/null || true
+            
+            echo "🚀 Iniciando Claude Code Router..."
+            rm -f /tmp/ccr.log
+            nohup ${pkgs.nodejs_22}/bin/npx -y @musistudio/claude-code-router@latest start > /tmp/ccr.log 2>&1 &
+            ROUTER_PID=$!
+            
+            cleanup() {
+                echo "🛑 Finalizando processos..."
+                kill $ROUTER_PID 2>/dev/null || true
+                pkill -f "ccr start" 2>/dev/null || true
+            }
+            trap cleanup EXIT INT TERM
+            
+            echo "Aguardando inicialização do router..."
+            for i in {1..20}; do
+                # Tentar conectar no socket do router
+                if (exec 3<>/dev/tcp/127.0.0.1/3456) 2>/dev/null; then
+                    exec 3>&-
+                    echo "✅ Router iniciado com sucesso na porta 3456."
+                    break
+                fi
+                sleep 0.5
+                echo -n "."
+            done
             echo ""
-            echo "╔════════════════════════════════════════════════════════╗"
-            echo "║   Claude Code + Qwen OAuth Environment                 ║"
-            echo "╚════════════════════════════════════════════════════════╝"
-            echo ""
-            echo "  Available commands:"
-            echo "    • claude-qwen  - Start Claude Code with Qwen backend"
-            echo ""
-            success "Environment ready!"
-            echo ""
+            
+            # 4. Iniciar o Claude Code
+            echo "🤖 Iniciando Claude Code via router..."
+            export ANTHROPIC_BASE_URL="http://127.0.0.1:3456"
+            export ANTHROPIC_AUTH_TOKEN="dummy-token"
+            # O Claude Code exige que a API BASE termine sem /v1 se estiver usando o router que simula o endpoint Anthropic
+            ${pkgs.nodejs_22}/bin/npx -y @anthropic-ai/claude-code@latest "$@"
           '';
-        };
+        in {
+          default = claude-qwen-script;
+        }
+      );
 
-        # Optional: expose the package for direct use
-        packages.default = claude-qwen;
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/claude-qwen";
+        };
       });
+
+      devShells = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          default = pkgs.mkShell {
+            buildInputs = [
+              pkgs.nodejs_22
+              pkgs.nodePackages.npm
+              pkgs.jq
+              self.packages.${system}.default
+            ];
+            
+            shellHook = ''
+              echo "================================================="
+              echo " Claude Code + Qwen OAuth (via nix flake) "
+              echo "================================================="
+              echo "Comandos disponíveis:"
+              echo "  claude-qwen    - Inicia o Claude Code integrado com Qwen"
+              echo "  npx ...        - Ferramentas NPM e nodejs disponiveis"
+              echo "================================================="
+            '';
+          };
+        }
+      );
+    };
 }
