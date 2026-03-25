@@ -11,7 +11,7 @@
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       
       qwenModel = "coder-model";
-      zaiModel = "glm-4.7";
+      zaiModel = "glm-5";
     in
     {
       packages = forAllSystems (system:
@@ -29,12 +29,17 @@
             
             # Processar argumentos para provedor
             PROVIDER="qwen"
+            MODEL_OVERRIDE=""
             declare -a CLAUDE_ARGS=()
             
             while [[ "$#" -gt 0 ]]; do
               case $1 in
                 --provider)
                   PROVIDER="$2"
+                  shift 2
+                  ;;
+                --model)
+                  MODEL_OVERRIDE="$2"
                   shift 2
                   ;;
                 *)
@@ -45,7 +50,7 @@
             done
             
             if [ "$PROVIDER" = "qwen" ]; then
-                QWEN_MODEL="${qwenModel}"
+                QWEN_MODEL="${MODEL_OVERRIDE:-${qwenModel}}"
                 QWEN_ISOLATION_DIR="$PWD/.pi/qwen"
                 mkdir -p "$QWEN_ISOLATION_DIR"
 
@@ -151,7 +156,7 @@
                 [ -d "$OLD_HOME/.ssh" ] && ln -sf "$OLD_HOME/.ssh" "$HOME/.ssh"
 
                 mkdir -p "$ROUTER_DIR"
-                echo "⚙️ Gerando configuração do router para Qwen (com modelo coder-model)..."
+                echo "⚙️ Gerando configuração do router para Qwen (com modelo $QWEN_MODEL)..."
                 ${pkgs.jq}/bin/jq -n \
                   --arg token "$TOKEN" \
                   --arg model "$QWEN_MODEL" \
@@ -211,32 +216,70 @@
                 ${pkgs.nodejs_22}/bin/npx -y @anthropic-ai/claude-code@latest --settings "$QWEN_SETTINGS" "''${CLAUDE_ARGS[@]}"
 
             elif [ "$PROVIDER" = "zai" ]; then
-                ZAI_MODEL="${zaiModel}"
-                ZAI_CREDS="$HOME/.zai/credentials.json"
-                ZAI_ISOLATION_DIR="$HOME/.zai-claude-env"
+                ZAI_MODEL="${MODEL_OVERRIDE:-${zaiModel}}"
+                ZAI_ISOLATION_DIR="$PWD/.pi/zai"
+                mkdir -p "$ZAI_ISOLATION_DIR"
+
+                # Configuração do Router
+                ROUTER_DIR="$ZAI_ISOLATION_DIR/.claude-code-router"
                 
-                if [ ! -f "$ZAI_CREDS" ] || [ -z "$(${pkgs.jq}/bin/jq -r '.api_key // empty' "$ZAI_CREDS" 2>/dev/null)" ]; then
-                    echo "⚠️ API Key Z.ai não encontrada."
-                    set +e
-                    read -s -p "🔑 Digite sua API Key Z.ai: " ZAI_KEY < /dev/tty
-                    echo ""
-                    set -e
-                    if [ -z "$ZAI_KEY" ]; then echo "❌ API Key vazia. Abortando."; exit 1; fi
-                    mkdir -p "$(dirname "$ZAI_CREDS")"
-                    ${pkgs.jq}/bin/jq -n --arg key "$ZAI_KEY" '{api_key: $key}' > "$ZAI_CREDS"
+                # Garantir que jq e nodejs estejam no PATH
+                export PATH="${pkgs.jq}/bin:${pkgs.nodejs_22}/bin:$PATH"
+
+                # Tentar encontrar um token VÁLIDO em múltiplos locais possíveis
+                TOKEN=""
+                
+                check_zai_token() {
+                    local file=$1
+                    if [ -f "$file" ]; then
+                        local t=""
+                        # Tentar formato auth.json ou credentials.json
+                        t=$(${pkgs.jq}/bin/jq -r '.api_key // .access_token // empty' "$file" 2>/dev/null)
+                        if [ -n "$t" ]; then
+                            TOKEN="$t"
+                            return 0
+                        fi
+                    fi
+                    return 1
+                }
+
+                # Ordem de preferência
+                if ! check_zai_token "$ZAI_ISOLATION_DIR/.zai/auth.json"; then
+                    if ! check_zai_token "$ZAI_ISOLATION_DIR/.zai/credentials.json"; then
+                        if ! check_zai_token "$HOME/.zai/auth.json"; then
+                            check_zai_token "$HOME/.zai/credentials.json" || true
+                        fi
+                    fi
                 fi
                 
-                TOKEN=$(${pkgs.jq}/bin/jq -r '.api_key' "$ZAI_CREDS")
+                if [ -z "$TOKEN" ]; then
+                    echo "⚠️ Nenhum token Z.ai válido encontrado."
+                    echo "Iniciando zcode para autenticação isolada em $ZAI_ISOLATION_DIR..."
+                    echo "👉 DICA: No zcode, o comando de autenticação iniciará automaticamente."
+                    echo "👉 IMPORTANTE: Após salvar a chave, digite /exit para o Claude iniciar."
+                    echo ""
+                    
+                    OLD_HOME_AUTH="$HOME"
+                    export HOME="$ZAI_ISOLATION_DIR"
+                    # zcode auth para configurar a chave
+                    ${pkgs.nodejs_22}/bin/npx -y @staticpayload/zai-code@latest auth
+                    export HOME="$OLD_HOME_AUTH"
+                    
+                    if check_zai_token "$ZAI_ISOLATION_DIR/.zai/auth.json"; then
+                        echo "✅ Novo token obtido."
+                    fi
+                fi
                 
-                # Preparar diretório isolado
-                mkdir -p "$ZAI_ISOLATION_DIR"
+                if [ -z "$TOKEN" ]; then
+                    echo "❌ Falha ao obter credenciais Z.ai."
+                    exit 1
+                fi
                 
-                # Configuração baseada em https://docs.z.ai/devpack/tool/claude
-                export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"
-                export ANTHROPIC_AUTH_TOKEN="$TOKEN"
-                export ANTHROPIC_API_KEY="$TOKEN"
-                export API_TIMEOUT_MS="3000000"
-                
+                # Preparar diretório isolado para Claude Code (.claude)
+                ZAI_CLAUDE_DIR="$ZAI_ISOLATION_DIR/.claude"
+                mkdir -p "$ZAI_CLAUDE_DIR"
+
+                # Configurações do Claude
                 ZAI_SETTINGS="$ZAI_ISOLATION_DIR/settings.json"
                 ${pkgs.jq}/bin/jq -n \
                   --arg sonnet "$ZAI_MODEL" \
@@ -248,10 +291,10 @@
                       "ANTHROPIC_DEFAULT_OPUS_MODEL": $sonnet
                     }
                   }' > "$ZAI_SETTINGS"
+
+                echo "⚙️ Isolando ambiente em $ZAI_ISOLATION_DIR..."
                 
-                echo "🚀 Iniciando Claude Code (Z.ai) - Isolado em $ZAI_ISOLATION_DIR"
-                
-                # Isolar ambiente alterando HOME e XDG
+                # Isolar ambiente alterando HOME e XDG ANTES de iniciar o router
                 OLD_HOME="$HOME"
                 export HOME="$ZAI_ISOLATION_DIR"
                 export XDG_CONFIG_HOME="$HOME/.config"
@@ -261,6 +304,64 @@
                 # Manter .gitconfig e SSH se existirem para que ferramentas funcionem
                 [ -f "$OLD_HOME/.gitconfig" ] && ln -sf "$OLD_HOME/.gitconfig" "$HOME/.gitconfig"
                 [ -d "$OLD_HOME/.ssh" ] && ln -sf "$OLD_HOME/.ssh" "$HOME/.ssh"
+
+                mkdir -p "$ROUTER_DIR"
+                echo "⚙️ Gerando configuração do router para Z.ai (modelo $ZAI_MODEL)..."
+                ${pkgs.jq}/bin/jq -n \
+                  --arg token "$TOKEN" \
+                  --arg model "$ZAI_MODEL" \
+                  '{
+                    "PORT": 3458,
+                    "LOG": true,
+                    "LOG_LEVEL": "debug",
+                    "Providers": [
+                      {
+                        "name": "zai",
+                        "api_base_url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
+                        "api_key": $token,
+                        "transformer": "zai",
+                        "models": ["claude-3-5-sonnet-20241022", "claude-3-7-sonnet-20250219", "claude-sonnet-4-6", "claude-sonnet-latest", $model, "glm-4.7"]
+                      }
+                    ],
+                    "Router": {
+                      "claude-3-5-sonnet-20241022": ("zai," + $model),
+                      "claude-3-7-sonnet-20250219": ("zai," + $model),
+                      "claude-3-5-sonnet-latest": ("zai," + $model),
+                      "claude-3-7-sonnet-latest": ("zai," + $model),
+                      "claude-sonnet-4-6": ("zai," + $model),
+                      "claude-sonnet-latest": ("zai," + $model),
+                      "default": ("zai," + $model),
+                      "think": ("zai," + $model)
+                    }
+                  }' > "$ROUTER_DIR/config.json"
+
+                echo "🚀 Reiniciando Claude Code Router (Z.ai)..."
+                pkill -9 -f "claude-code-router" 2>/dev/null || true
+                pkill -9 -f "ccr start" 2>/dev/null || true
+                sleep 1
+                rm -f /tmp/ccr_zai.log
+                nohup ${pkgs.nodejs_22}/bin/npx -y @musistudio/claude-code-router@latest start > /tmp/ccr_zai.log 2>&1 &
+                ROUTER_PID=$!
+                
+                cleanup() { 
+                  kill -9 $ROUTER_PID 2>/dev/null || true; 
+                  pkill -9 -f "claude-code-router" 2>/dev/null || true; 
+                }
+                trap cleanup EXIT INT TERM
+                
+                for i in {1..20}; do
+                    if (exec 3<>/dev/tcp/127.0.0.1/3458) 2>/dev/null; then
+                        exec 3>&-
+                        echo "✅ Router na porta 3458."
+                        break
+                    fi
+                    sleep 0.5
+                done
+                
+                echo "🚀 Iniciando Claude Code (Z.ai)..."
+                export ANTHROPIC_BASE_URL="http://127.0.0.1:3458"
+                export ANTHROPIC_API_KEY="sk-ant-dummy"
+                export ANTHROPIC_AUTH_TOKEN="sk-ant-dummy"
                 
                 ${pkgs.nodejs_22}/bin/npx -y @anthropic-ai/claude-code@latest --settings "$ZAI_SETTINGS" "''${CLAUDE_ARGS[@]}"
             else
@@ -268,8 +369,14 @@
                 exit 1
             fi
           '';
+          
+          zai-script = pkgs.writeShellScriptBin "zai" ''
+            #!/usr/bin/env bash
+            ${claude-qwen-script}/bin/claude-qwen --provider zai "$@"
+          '';
         in {
           default = claude-qwen-script;
+          zai = zai-script;
         }
       );
 
@@ -277,6 +384,10 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/claude-qwen";
+        };
+        zai = {
+          type = "app";
+          program = "${self.packages.${system}.zai}/bin/zai";
         };
       });
 
@@ -290,6 +401,7 @@
               pkgs.nodePackages.npm
               pkgs.jq
               self.packages.${system}.default
+              self.packages.${system}.zai
             ];
             
             shellHook = ''
@@ -298,7 +410,8 @@
               echo "==========================================================="
               echo "Comandos disponíveis:"
               echo "  claude-qwen                 - Inicia com Qwen (Padrão)"
-              echo "  claude-qwen --provider zai  - Inicia com Z.ai"
+              echo "  zai                         - Inicia com Z.ai (Coding Mode)"
+              echo "  claude-qwen --provider zai  - Inicia com Z.ai (Legado)"
               echo "  npx ...                     - Ferramentas NPM e nodejs"
               echo "==========================================================="
             '';
