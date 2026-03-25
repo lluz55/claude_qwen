@@ -8,7 +8,7 @@ Este projeto cria um ambiente de desenvolvimento auto-contido que:
 
 1. **Gerencia autenticação OAuth** com Qwen Code
 2. **Inicia um servidor de ponte** (bridge router) que redireciona requisições para a API Qwen
-3. **Abre o Claude Code** normalmente, mas usando o modelo `qwen-coder-plus` como backend
+abre o Claude Code normalmente, mas usando o modelo `coder-model` como backend
 
 ### Arquitetura
 
