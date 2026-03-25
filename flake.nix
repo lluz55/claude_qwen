@@ -50,7 +50,7 @@
             done
             
             if [ "$PROVIDER" = "qwen" ]; then
-                QWEN_MODEL="${MODEL_OVERRIDE:-${qwenModel}}"
+                QWEN_MODEL="''${MODEL_OVERRIDE:-${qwenModel}}"
                 QWEN_ISOLATION_DIR="$PWD/.pi/qwen"
                 mkdir -p "$QWEN_ISOLATION_DIR"
 
@@ -216,7 +216,7 @@
                 ${pkgs.nodejs_22}/bin/npx -y @anthropic-ai/claude-code@latest --settings "$QWEN_SETTINGS" "''${CLAUDE_ARGS[@]}"
 
             elif [ "$PROVIDER" = "zai" ]; then
-                ZAI_MODEL="${MODEL_OVERRIDE:-${zaiModel}}"
+                ZAI_MODEL="''${MODEL_OVERRIDE:-${zaiModel}}"
                 ZAI_ISOLATION_DIR="$PWD/.pi/zai"
                 mkdir -p "$ZAI_ISOLATION_DIR"
 
