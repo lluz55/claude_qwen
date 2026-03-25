@@ -1,4 +1,4 @@
-# Design Spec: CLI Model Selection for Claude Code + Qwen/Z.ai
+# Design Spec: CLI Model Selection for Claude Code + Qwen/Z.ai (COMPLETED)
 
 ## Goal
 Implement a `--model` command-line flag to allow users to specify which LLM model to use for both Qwen and Z.ai providers.
